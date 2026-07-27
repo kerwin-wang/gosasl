@@ -1,3 +1,4 @@
+//go:build kerberos
 // +build kerberos
 
 package gosasl
@@ -73,10 +74,23 @@ func (m *GSSAPIMechanism) step(challenge []byte) ([]byte, error) {
 			return nil, err
 		}
 
-		var srcName *gssapi.Name
 		if m.context.contextId != nil {
-			srcName, _, _, _, _, _, _, _ = m.context.contextId.InquireContext()
+			// InquireContext 在 native 侧返回两个需要显式 gss_release_name 的 Name。
+			// 原实现只取 srcName 且三个返回值全部丢弃，srcName/targetName 会在每次
+			// 成功 Kerberos 握手后永久滞留 native heap，Go GC 无法回收，表现为
+			// RSS/WSS 随建连次数持续上涨。mechType 指向 GSS 库的静态 OID，Release
+			// 对其是 no-op，但仍统一调用以兼容依赖后续实现。
+			srcName, targetName, _, mechType, _, _, _, inquireErr := m.context.contextId.InquireContext()
 			if srcName != nil {
+				defer srcName.Release()
+			}
+			if targetName != nil {
+				defer targetName.Release()
+			}
+			if mechType != nil {
+				defer mechType.Release()
+			}
+			if inquireErr == nil && srcName != nil {
 				m.user = srcName.String()
 			}
 		}
@@ -206,7 +220,6 @@ type GSSAPIContext struct {
 	availFlags     uint32
 }
 
-//
 func newGSSAPIContext() *GSSAPIContext {
 	var c = &GSSAPIContext{
 		reqFlags: uint32(gssapi.GSS_C_INTEG_FLAG) + uint32(gssapi.GSS_C_MUTUAL_FLAG) + uint32(gssapi.GSS_C_SEQUENCE_FLAG) + uint32(gssapi.GSS_C_CONF_FLAG),
@@ -242,8 +255,7 @@ func initClientContext(c *GSSAPIContext, service string, inputToken []byte) erro
 	preparedName := prepareServiceName(c)
 	defer preparedName.Release()
 
-	// Error is purposedly ignored.
-	contextId, _, token, outputRetFlags, _, err := c.InitSecContext(
+	contextId, actualMechType, token, outputRetFlags, _, err := c.InitSecContext(
 		nil,
 		c.contextId,
 		preparedName,
@@ -252,10 +264,21 @@ func initClientContext(c *GSSAPIContext, service string, inputToken []byte) erro
 		0,
 		c.GSS_C_NO_CHANNEL_BINDINGS,
 		_inputToken)
-	defer token.Release()
-
-	c.token = token.Bytes()
-	c.contextId = contextId
+	// InitSecContext may return a partial context and an error token together
+	// with an error. Take ownership before returning so Dispose can release the
+	// context, and release all per-call outputs here.
+	if actualMechType != nil {
+		defer actualMechType.Release()
+	}
+	if token != nil {
+		defer token.Release()
+		c.token = token.Bytes()
+	} else {
+		c.token = nil
+	}
+	if contextId != nil {
+		c.contextId = contextId
+	}
 	c.availFlags = outputRetFlags
 	return err
 }
@@ -299,11 +322,42 @@ func (c *GSSAPIContext) unwrap(original []byte) (unwrapped []byte, err error) {
 }
 
 // Dispose releases the acquired memory and destroys sensitive information
+//
+// 修复: 原实现对 contextId 调用的是 Unload(), 但 CtxId 是通过嵌入/关联 Lib 获得
+// 该方法的, Unload() 实际语义是 dlclose 动态库, 并不会调用 gss_delete_sec_context
+// 真正释放 security context; 这会导致每次失败/成功的 Kerberos 握手都在 native 侧
+// 残留未释放的 GSS context, 表现为进程 RSS/匿名内存持续增长而 Go heap 不受影响。
+//
+// 正确顺序: 先释放 security context(gss_delete_sec_context), 再释放凭据
+// (若曾从 keytab 加载), 最后才卸载动态库; 释放后置空指针以保证多次调用幂等,
+// 避免对已释放的 native 资源重复操作。
 func (c *GSSAPIContext) dispose() error {
+	var firstErr error
+
 	if c.contextId != nil {
-		return c.contextId.Unload()
+		// CtxId.Release() 是 DeleteSecContext() 的别名, 最终调用 gss_delete_sec_context。
+		if err := c.contextId.Release(); err != nil {
+			firstErr = err
+		}
+		c.contextId = nil
 	}
-	return nil
+
+	if c.credential != nil {
+		if err := c.credential.Release(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		c.credential = nil
+	}
+
+	if c.Lib != nil {
+		if err := c.Lib.Unload(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		c.Lib = nil
+	}
+
+	c.token = nil
+	return firstErr
 }
 
 // IntegAvail returns true in the integ_flag is available and therefore a security layer can be established

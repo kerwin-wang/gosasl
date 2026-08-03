@@ -31,7 +31,10 @@ type GSSAPIMechanism struct {
 
 // NewGSSAPIMechanism returns a new GSSAPIMechanism
 func NewGSSAPIMechanism(service string) (mechanism *GSSAPIMechanism, err error) {
-	context := newGSSAPIContext()
+	context, err := newGSSAPIContext()
+	if err != nil {
+		return nil, err
+	}
 	mechanism = &GSSAPIMechanism{
 		config:           newDefaultConfig("GSSAPI"),
 		service:          service,
@@ -209,7 +212,6 @@ type GSSAPIContext struct {
 	gssapi.Options
 
 	*gssapi.Lib `json:"-"`
-	loadonce    sync.Once
 
 	// Service credentials loaded from keytab
 	credential     *gssapi.CredId
@@ -220,19 +222,59 @@ type GSSAPIContext struct {
 	availFlags     uint32
 }
 
-func newGSSAPIContext() *GSSAPIContext {
+// GSSAPI 动态库 (libgssapi_krb5.so) 是进程级、无状态的纯函数库: 所有租户相关的
+// 状态都封装在 per-connection 的 gss_cred_id_t / gss_ctx_id_t handle 中, 库本身
+// 不持有任何用户身份。因此在整个进程内只 dlopen 一次并常驻, 是GSSAPI/MIT-krb5
+// 的标准用法。
+//
+// 之前的实现把 dlopen/dlclose 放在每个连接的生命周期里(dispose 调用 Lib.Unload),
+// 而 dlclose 是进程全局的引用计数操作: 多租户并发下, 某个连接关闭时若把全局引用
+// 计数打到 0, libgssapi_krb5.so 会被 munmap, 而其它goroutine 保存在ftable 里
+// 指向该代码段的函数指针 (Fp_gss_*) 立刻变为悬空指针, 下一次调用即触发 SIGSEGV
+// (SEGV_MAPERR, signal arrived during cgo execution)。此外 MIT krb5 本身注册了
+// atexit/TLS destructor、com_err 错误表并会内部 dlopen mechanism plugin, 根本
+// 不支持被 dlclose。
+//
+// 单例化后: 函数指针在进程生命周期内恒定有效, 从结构上消除 use-after-unload;
+// 各租户的隔离仍完全由各自独立的 credential / contextId handle 保证, 多个 handle
+// 共享同一份只读函数表不会造成任何身份串号(等价于多线程共享同一个 libc)。
+var (
+	globalLib     *gssapi.Lib
+	globalLibOnce sync.Once
+	globalLibErr  error
+)
+
+// loadSharedLib 进程级懒加载唯一一份 GSSAPI 动态库并返回, 永不 Unload。
+func loadSharedLib(debug bool, prefix string) (*gssapi.Lib, error) {
+	globalLibOnce.Do(func() {
+		max := gssapi.Err + 1
+		if debug {
+			max = gssapi.MaxSeverity
+		}
+		pp := make([]gssapi.Printer, 0, max)
+		for i := gssapi.Severity(0); i < max; i++ {
+			p := log.New(os.Stderr,
+				fmt.Sprintf("%s: %s\t", prefix, i),
+				log.LstdFlags)
+			pp = append(pp, p)
+		}
+		globalLib, globalLibErr = gssapi.Load(&gssapi.Options{Printers: pp})
+	})
+	return globalLib, globalLibErr
+}
+
+func newGSSAPIContext() (*GSSAPIContext, error) {
 	var c = &GSSAPIContext{
 		reqFlags: uint32(gssapi.GSS_C_INTEG_FLAG) + uint32(gssapi.GSS_C_MUTUAL_FLAG) + uint32(gssapi.GSS_C_SEQUENCE_FLAG) + uint32(gssapi.GSS_C_CONF_FLAG),
 	}
 	prefix := "gosasl-client"
-	err := loadlib(c.DebugLog, prefix, c)
-	if err != nil {
-		log.Fatal(err)
+	if err := loadlib(c.DebugLog, prefix, c); err != nil {
+		return nil, err
 	}
 
 	j, _ := json.MarshalIndent(c, "", "  ")
 	c.Debug(fmt.Sprintf("Config: %s", string(j)))
-	return c
+	return c, nil
 }
 
 // InitClientContext initializes the context and gets the response(token)
@@ -323,14 +365,14 @@ func (c *GSSAPIContext) unwrap(original []byte) (unwrapped []byte, err error) {
 
 // Dispose releases the acquired memory and destroys sensitive information
 //
-// 修复: 原实现对 contextId 调用的是 Unload(), 但 CtxId 是通过嵌入/关联 Lib 获得
-// 该方法的, Unload() 实际语义是 dlclose 动态库, 并不会调用 gss_delete_sec_context
-// 真正释放 security context; 这会导致每次失败/成功的 Kerberos 握手都在 native 侧
-// 残留未释放的 GSS context, 表现为进程 RSS/匿名内存持续增长而 Go heap 不受影响。
+// 只释放 per-connection 的 native 资源: 先释放 security context
+// (gss_delete_sec_context), 再释放凭据(若曾从 keytab 加载 gss_acquire_cred)。
+// 释放后置空指针以保证多次调用幂等, 避免对已释放的 native 资源重复操作。
 //
-// 正确顺序: 先释放 security context(gss_delete_sec_context), 再释放凭据
-// (若曾从 keytab 加载), 最后才卸载动态库; 释放后置空指针以保证多次调用幂等,
-// 避免对已释放的 native 资源重复操作。
+// 关键: 绝不在这里调用 c.Lib.Unload()。libgssapi_krb5.so 是进程级共享的单例
+// (见 loadSharedLib的说明), dlclose 会 munmap 掉仍被其它并发连接使用的函数
+// 代码段, 造成 use-after-unload 崩溃; 且 MIT krb5 本身不支持被 dlclose。这里
+// 仅解除本context 对共享 Lib 的引用, 不触碰库的加载状态。
 func (c *GSSAPIContext) dispose() error {
 	var firstErr error
 
@@ -349,12 +391,8 @@ func (c *GSSAPIContext) dispose() error {
 		c.credential = nil
 	}
 
-	if c.Lib != nil {
-		if err := c.Lib.Unload(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		c.Lib = nil
-	}
+	// 不Unload 共享库, 仅解除引用。
+	c.Lib = nil
 
 	c.token = nil
 	return firstErr
@@ -370,21 +408,10 @@ func (c *GSSAPIContext) confAvail() bool {
 	return c.availFlags&uint32(gssapi.GSS_C_CONF_FLAG) != 0
 }
 
+// loadlib 让每个 context 引用进程级唯一的共享 Lib(懒加载, 永不卸载),
+// 而非各自 dlopen 一份。这样所有租户共享同一份只读函数表, 消除 dlclose 竞态。
 func loadlib(debug bool, prefix string, c *GSSAPIContext) error {
-	max := gssapi.Err + 1
-	if debug {
-		max = gssapi.MaxSeverity
-	}
-	pp := make([]gssapi.Printer, 0, max)
-	for i := gssapi.Severity(0); i < max; i++ {
-		p := log.New(os.Stderr,
-			fmt.Sprintf("%s: %s\t", prefix, i),
-			log.LstdFlags)
-		pp = append(pp, p)
-	}
-	c.Options.Printers = pp
-
-	lib, err := gssapi.Load(&c.Options)
+	lib, err := loadSharedLib(debug, prefix)
 	if err != nil {
 		return err
 	}
